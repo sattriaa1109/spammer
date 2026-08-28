@@ -10,6 +10,10 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    deploy:
+      resources:
+        limits:
+          memory: 256M
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d fb_bot_db"]
       interval: 5s
@@ -25,6 +29,10 @@ services:
       - HEADLESS=true
     ports:
       - "8000:8000"
+    deploy:
+      resources:
+        limits:
+          memory: 768M
     depends_on:
       db:
         condition: service_healthy

@@ -151,6 +151,11 @@ async def run_auto_like_bot(target_id: int, account_id: int):
                         "--no-sandbox",
                         "--disable-setuid-sandbox",
                         "--disable-infobars",
+                        "--disable-dev-shm-usage",
+                        "--disable-gpu",
+                        "--disable-extensions",
+                        "--disable-software-rasterizer",
+                        "--no-zygote",
                         "--window-size=1366,768",
                     ],
                 )
@@ -167,6 +172,9 @@ async def run_auto_like_bot(target_id: int, account_id: int):
 
                 page = await context.new_page()
                 await stealth_async(page)
+
+                # Block heavy media/images to save RAM and bandwidth
+                await page.route("**/*.{png,jpg,jpeg,gif,webp,mp4,webm}", lambda route: route.abort())
 
                 try:
                     logger.info(f"Navigating to URL: {target.url_post}")
