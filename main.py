@@ -10,7 +10,7 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from playwright.async_api import async_playwright, Page
-from playwright_stealth import stealth_async
+from playwright_stealth import stealth
 
 from database import get_db, AsyncSessionLocal, engine
 from models import Base, Account, Target, Log
@@ -171,7 +171,7 @@ async def run_auto_like_bot(target_id: int, account_id: int):
                     logger.info(f"Loaded {len(cookies)} cookies into browser context.")
 
                 page = await context.new_page()
-                await stealth_async(page)
+                await stealth(page)
 
                 # Block heavy media/images to save RAM and bandwidth
                 await page.route("**/*.{png,jpg,jpeg,gif,webp,mp4,webm}", lambda route: route.abort())
