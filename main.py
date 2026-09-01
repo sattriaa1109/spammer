@@ -531,3 +531,4 @@ if os.path.isdir(_dist):
             raise HTTPException(status_code=404)
         with open(os.path.join(_dist, "index.html"), encoding="utf-8") as f:
             return f.read()
+    
