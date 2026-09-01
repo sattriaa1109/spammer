@@ -8,7 +8,8 @@ from datetime import datetime, timedelta
 from typing import Optional, Any
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, status, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc, delete
@@ -31,6 +32,14 @@ HEADLESS_MODE = os.getenv("HEADLESS", "true").lower() == "true"
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
 
 app = FastAPI(title="Facebook Auto-Like Bot API", version="1.1.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Track active background tasks: target_id -> asyncio.Task
 active_tasks: dict[int, asyncio.Task] = {}
