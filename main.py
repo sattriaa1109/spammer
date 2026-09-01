@@ -9,14 +9,9 @@ from typing import Optional, Any
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, status, Request
 from fastapi.middleware.cors import CORSMiddleware
-<<<<<<< HEAD
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
-=======
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
->>>>>>> e3802ab (main.py)
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc, delete
 from sqlalchemy.exc import SQLAlchemyError, IntegrityError, OperationalError
@@ -47,11 +42,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-<<<<<<< HEAD
-# Track active background tasks: target_id -> asyncio.Task
-=======
 # Active asyncio tasks: target_id -> asyncio.Task
->>>>>>> e3802ab (main.py)
 active_tasks: dict[int, asyncio.Task] = {}
 
 
