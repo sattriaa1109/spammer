@@ -27,6 +27,7 @@ services:
     environment:
       - DATABASE_URL=postgresql+asyncpg://postgres:postgrespassword@db:5432/fb_bot_db
       - HEADLESS=true
+      - ADMIN_PASSWORD=admin123
     ports:
       - "8000:8000"
     deploy:
