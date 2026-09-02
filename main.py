@@ -437,6 +437,31 @@ async def stop_target(target_id: int, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=500, detail=f"DB error: {e}")
 
 
+@app.delete("/api/targets/{target_id}")
+async def delete_target(target_id: int, db: AsyncSession = Depends(get_db)):
+    """Delete a target and its associated logs. Also cancels any running task."""
+    try:
+        target = await db.get(Target, target_id)
+        if not target:
+            raise HTTPException(status_code=404, detail="Target not found.")
+
+        # Cancel active task if running
+        task = active_tasks.pop(target_id, None)
+        if task and not task.done():
+            task.cancel()
+
+        # Delete associated logs first (foreign key)
+        await db.execute(delete(Log).where(Log.target_id == target_id))
+        await db.delete(target)
+        await db.commit()
+        return {"message": f"Target {target_id} deleted successfully."}
+    except HTTPException:
+        raise
+    except SQLAlchemyError as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {e}")
+
+
 # ── Monitoring ───────────────────────────────────────────────────
 
 @app.get("/api/targets")
