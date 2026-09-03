@@ -10,8 +10,9 @@ from urllib.parse import urlparse
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, status, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc, delete, func, update
 from sqlalchemy.exc import SQLAlchemyError, IntegrityError, OperationalError
@@ -741,6 +742,32 @@ async def stop_target(target_id: int, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=500, detail="Database error occurred while stopping target task.")
 
 
+@app.delete("/api/targets/{target_id}", status_code=status.HTTP_200_OK)
+async def delete_target(target_id: int, db: AsyncSession = Depends(get_db)):
+    """Delete a target and its associated logs. Also cancels any running task."""
+    try:
+        target = await db.get(Target, target_id)
+        if not target:
+            raise HTTPException(status_code=404, detail="Target not found.")
+
+        if target_id in active_tasks:
+            task = active_tasks[target_id]
+            if not task.done():
+                task.cancel()
+            del active_tasks[target_id]
+
+        await db.execute(delete(Log).where(Log.target_id == target_id))
+        await db.delete(target)
+        await db.commit()
+        return {"message": f"Target {target_id} deleted successfully."}
+    except HTTPException:
+        raise
+    except SQLAlchemyError as e:
+        await db.rollback()
+        logger.error(f"Database error in delete_target: {e}")
+        raise HTTPException(status_code=500, detail="Database error occurred while deleting target.")
+
+
 @app.get("/api/targets", status_code=status.HTTP_200_OK)
 async def list_targets(db: AsyncSession = Depends(get_db)):
     try:
@@ -813,11 +840,27 @@ async def get_stats(db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=500, detail="Database error occurred while fetching stats.")
 
 
-@app.get("/")
-async def root():
-    return {
-        "status": "online",
-        "service": "Facebook Auto-Like Bot API",
-        "version": "1.1.0",
-        "docs": "/docs"
-    }
+# Serve React Frontend
+_dist = os.path.join(os.path.dirname(__file__), "dist")
+
+if os.path.isdir(_dist):
+    _assets = os.path.join(_dist, "assets")
+    if os.path.isdir(_assets):
+        app.mount("/assets", StaticFiles(directory=_assets), name="assets")
+
+    @app.get("/favicon.svg", include_in_schema=False)
+    async def favicon():
+        return FileResponse(os.path.join(_dist, "favicon.svg"))
+
+    @app.get("/", response_class=HTMLResponse, include_in_schema=False)
+    async def spa_root():
+        with open(os.path.join(_dist, "index.html"), encoding="utf-8") as f:
+            return f.read()
+
+    @app.get("/{full_path:path}", response_class=HTMLResponse, include_in_schema=False)
+    async def spa_catch_all(full_path: str):
+        reserved = ("api/", "health", "docs", "openapi.json", "redoc")
+        if any(full_path.startswith(r) for r in reserved):
+            raise HTTPException(status_code=404)
+        with open(os.path.join(_dist, "index.html"), encoding="utf-8") as f:
+            return f.read()
