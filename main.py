@@ -5,18 +5,18 @@ import os
 import random
 import re
 from datetime import datetime, timedelta
-from typing import Optional, Any
+from typing import Optional, Any, List, Dict
+from urllib.parse import urlparse
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, status, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, desc, delete
+from sqlalchemy import select, desc, delete, func, update
 from sqlalchemy.exc import SQLAlchemyError, IntegrityError, OperationalError
 
 from playwright.async_api import async_playwright, Page
-from playwright_stealth import stealth
 
 from database import get_db, AsyncSessionLocal, engine
 from models import Base, Account, Target, Log
@@ -42,7 +42,114 @@ app.add_middleware(
 )
 
 # Track active background tasks: target_id -> asyncio.Task
-active_tasks: dict[int, asyncio.Task] = {}
+active_tasks: Dict[int, asyncio.Task] = {}
+
+
+async def apply_stealth(page: Page):
+    """Applies stealth evasion tactics to the Playwright page object."""
+    try:
+        from playwright_stealth import stealth_async
+        await stealth_async(page)
+    except (ImportError, TypeError):
+        try:
+            from playwright_stealth import stealth
+            if callable(stealth):
+                res = stealth(page)
+                if asyncio.iscoroutine(res):
+                    await res
+            else:
+                from playwright_stealth import Stealth
+                await Stealth().apply_stealth_async(page)
+        except Exception:
+            from playwright_stealth import Stealth
+            await Stealth().apply_stealth_async(page)
+
+
+def sanitize_cookies(cookies: Any) -> List[dict]:
+    """Sanitizes raw cookie objects from string/JSON/dict into Playwright compatible list of dicts."""
+    if isinstance(cookies, str):
+        try:
+            cookies = json.loads(cookies)
+        except Exception:
+            return []
+    if isinstance(cookies, dict):
+        cookies = [cookies]
+    if not isinstance(cookies, list):
+        return []
+
+    clean_cookies = []
+    for c in cookies:
+        if not isinstance(c, dict):
+            continue
+        c_clean = dict(c)
+
+        if "name" not in c_clean or "value" not in c_clean:
+            continue
+
+        c_clean["name"] = str(c_clean["name"])
+        c_clean["value"] = str(c_clean["value"])
+
+        if "domain" not in c_clean and "url" not in c_clean:
+            c_clean["domain"] = ".facebook.com"
+
+        if "path" not in c_clean and "url" not in c_clean:
+            c_clean["path"] = "/"
+
+        if "sameSite" in c_clean:
+            same_site_val = str(c_clean["sameSite"]).capitalize()
+            if same_site_val in ["Strict", "Lax", "None"]:
+                c_clean["sameSite"] = same_site_val
+            elif same_site_val in ["No_restriction", "Unspecified", "None_specified"]:
+                c_clean["sameSite"] = "None"
+            else:
+                c_clean.pop("sameSite", None)
+
+        if "expirationDate" in c_clean:
+            try:
+                c_clean["expires"] = float(c_clean["expirationDate"])
+                c_clean.pop("expirationDate", None)
+            except (ValueError, TypeError):
+                c_clean.pop("expirationDate", None)
+
+        allowed_keys = {"name", "value", "url", "domain", "path", "expires", "httpOnly", "secure", "sameSite"}
+        filtered_cookie = {k: v for k, v in c_clean.items() if k in allowed_keys and v is not None}
+        clean_cookies.append(filtered_cookie)
+
+    return clean_cookies
+
+
+def parse_proxy(proxy_str: Optional[str]) -> Optional[dict]:
+    """Parses proxy string into Playwright format supporting HTTP/HTTPS/SOCKS5 and Auth."""
+    if not proxy_str or not proxy_str.strip():
+        return None
+    proxy_str = proxy_str.strip()
+
+    # Format: host:port:username:password
+    parts = proxy_str.split(":")
+    if len(parts) == 4 and not proxy_str.startswith("http"):
+        host, port, user, password = parts
+        return {
+            "server": f"http://{host}:{port}",
+            "username": user,
+            "password": password
+        }
+
+    if "://" not in proxy_str:
+        proxy_str = f"http://{proxy_str}"
+
+    try:
+        parsed = urlparse(proxy_str)
+        server = f"{parsed.scheme}://{parsed.hostname}"
+        if parsed.port:
+            server += f":{parsed.port}"
+        config = {"server": server}
+        if parsed.username:
+            config["username"] = parsed.username
+        if parsed.password:
+            config["password"] = parsed.password
+        return config
+    except Exception:
+        return {"server": proxy_str}
 
 
 async def cleanup_old_logs():
@@ -60,6 +167,25 @@ async def cleanup_old_logs():
         except Exception as e:
             await session.rollback()
             logger.error(f"Unexpected error during log auto-cleanup: {e}")
+
+
+async def reset_stale_pending_tasks():
+    """Updates orphaned 'pending' or 'in_progress' tasks on server startup."""
+    async with AsyncSessionLocal() as session:
+        try:
+            stmt = (
+                update(Target)
+                .where(Target.status.in_(["pending", "in_progress"]))
+                .values(status="failed")
+            )
+            res = await session.execute(stmt)
+            if res.rowcount > 0:
+                session.add(Log(message=f"Server startup: marked {res.rowcount} interrupted/stale tasks as failed."))
+                await session.commit()
+                logger.info(f"Marked {res.rowcount} stale tasks as failed.")
+        except Exception as e:
+            await session.rollback()
+            logger.error(f"Error resetting stale tasks: {e}")
 
 
 async def periodic_log_cleanup():
@@ -85,6 +211,9 @@ async def startup_event():
             await conn.run_sync(Base.metadata.create_all)
         logger.info("Database tables verified/created successfully.")
         
+        # Mark interrupted/stale tasks as failed on startup
+        await reset_stale_pending_tasks()
+
         # Run log cleanup on startup
         await cleanup_old_logs()
         
@@ -152,104 +281,194 @@ class AutoLikeResponse(BaseModel):
     status: str
 
 
-def parse_proxy(proxy_str: Optional[str]) -> Optional[dict]:
-    if not proxy_str:
-        return None
-    if "://" not in proxy_str:
-        proxy_str = f"http://{proxy_str}"
-    return {"server": proxy_str}
+async def handle_facebook_popups(page: Page):
+    """Dismiss cookie consent banners or login modals if present on the page."""
+    popup_selectors = [
+        'button[data-cookiebanner="accept_button"]',
+        'button[title="Allow all cookies"]',
+        'button[title="Terima Semua Cookie"]',
+        'button:has-text("Allow all cookies")',
+        'button:has-text("Terima Semua Cookie")',
+        'button:has-text("Izinkan semua cookie")',
+        'button:has-text("Decline optional cookies")',
+        'div[role="dialog"] button[aria-label="Close"]',
+        'div[role="dialog"] button[aria-label="Tutup"]',
+        '[aria-label="Decline optional cookies"]',
+        '[aria-label="Tutup"]',
+        '[aria-label="Close"]',
+    ]
+    for sel in popup_selectors:
+        try:
+            btn = page.locator(sel).first
+            if await btn.is_visible(timeout=1000):
+                logger.info(f"Dismissing Facebook popup: {sel}")
+                await btn.click(timeout=3000)
+                await asyncio.sleep(1)
+        except Exception:
+            pass
+
+
+async def check_login_status(page: Page):
+    """Verifies that the browser session is logged in and not redirected to login page."""
+    current_url = page.url.lower()
+    if "login" in current_url or "checkpoint" in current_url:
+        raise Exception("Account session cookies are invalid or expired (redirected to Facebook login page).")
+
+    # Check for login form fields
+    try:
+        login_form = page.locator('input[name="email"], input[id="email"]')
+        if await login_form.count() > 0 and await login_form.first.is_visible(timeout=1000):
+            raise Exception("Account session cookies are invalid or expired (login form detected).")
+    except Exception as e:
+        if "login" in str(e).lower() or "expired" in str(e).lower():
+            raise
 
 
 async def simulate_human_behavior(page: Page):
-    delay = random.uniform(5.0, 15.0)
-    logger.info(f"Applying random navigation delay: {delay:.2f} seconds")
+    """Simulates realistic human browsing behavior with random scrolling and pauses."""
+    delay = random.uniform(3.0, 7.0)
+    logger.info(f"Applying navigation delay: {delay:.2f} seconds")
     await asyncio.sleep(delay)
 
     try:
         logger.info("Simulating scrolling behavior...")
-        await page.evaluate("window.scrollBy(0, window.innerHeight / 2)")
-        await asyncio.sleep(random.uniform(2.0, 4.0))
-        await page.evaluate("window.scrollBy(0, -100)")
+        await page.evaluate("window.scrollBy(0, window.innerHeight / 3)")
         await asyncio.sleep(random.uniform(1.5, 3.0))
+        await page.evaluate("window.scrollBy(0, -100)")
+        await asyncio.sleep(random.uniform(1.0, 2.0))
     except Exception as e:
         logger.warning(f"Scroll simulation warning: {e}")
 
 
 async def perform_auto_like(page: Page) -> bool:
+    """Locates and clicks the Facebook Like/Suka button, or detects if post is already liked."""
     logger.info("Searching for Like/Suka button...")
-    
+    await handle_facebook_popups(page)
+
+    # 1. Check if post is ALREADY LIKED
+    already_liked_selectors = [
+        'div[role="button"][aria-label*="Hapus Suka"]',
+        'div[role="button"][aria-label*="Batal Suka"]',
+        'div[role="button"][aria-label*="Remove Like"]',
+        'div[role="button"][aria-label*="Unlike"]',
+        'div[role="button"][aria-pressed="true"]',
+        'xpath=//div[@role="button" and (contains(@aria-label, "Batal") or contains(@aria-label, "Hapus") or contains(@aria-label, "Remove") or contains(@aria-label, "Unlike"))]',
+        'xpath=//span[text()="Disukai" or text()="Liked"]',
+    ]
+
+    for sel in already_liked_selectors:
+        try:
+            loc = page.locator(sel)
+            if await loc.count() > 0 and await loc.first.is_visible(timeout=1000):
+                logger.info("Post is already liked by this account.")
+                return True
+        except Exception:
+            pass
+
+    # 2. Search for UNLIKED Like/Suka button
     like_selectors = [
-        page.get_by_role("button", name=re.compile(r"^(suka|like)$", re.IGNORECASE)),
-        page.locator('div[aria-label="Suka"][role="button"], div[aria-label="Like"][role="button"]'),
-        page.locator('xpath=//div[@role="button" and (contains(@aria-label, "Suka") or contains(@aria-label, "Like"))]'),
-        page.locator('xpath=//span[text()="Suka" or text()="Like"]/ancestor::div[@role="button"]'),
+        'div[role="button"][aria-label="Suka"]',
+        'div[role="button"][aria-label="Like"]',
+        'div[role="button"][aria-label*="Suka"]',
+        'div[role="button"][aria-label*="Like"]',
+        'xpath=//div[@role="button" and (contains(@aria-label, "Suka") or contains(@aria-label, "Like"))]',
+        'xpath=//span[(text()="Suka" or text()="Like")]/ancestor::div[@role="button"]',
+        'xpath=//span[contains(text(), "Suka") or contains(text(), "Like")]/ancestor::div[@role="button"]',
+        'a[href*="/a/like.php"]',
+        'button:has-text("Suka")',
+        'button:has-text("Like")',
     ]
 
     button_found = None
-    for locator in like_selectors:
+    for selector in like_selectors:
         try:
-            count = await locator.count()
-            if count > 0:
-                for i in range(count):
-                    candidate = locator.nth(i)
-                    if await candidate.is_visible():
-                        button_found = candidate
-                        break
+            loc = page.locator(selector)
+            count = await loc.count()
+            for i in range(count):
+                candidate = loc.nth(i)
+                if await candidate.is_visible(timeout=1000):
+                    # Exclude comment / share buttons if selector is broad
+                    label = (await candidate.get_attribute("aria-label") or "").lower()
+                    if "komentar" in label or "comment" in label or "bagikan" in label or "share" in label:
+                        continue
+                    button_found = candidate
+                    break
             if button_found:
                 break
         except Exception as ex:
-            logger.debug(f"Locator check error: {ex}")
+            logger.debug(f"Selector '{selector}' check error: {ex}")
             continue
+
+    # Fallback to get_by_role without restrictive anchors
+    if not button_found:
+        try:
+            role_btn = page.get_by_role("button", name=re.compile(r"(suka|like)", re.IGNORECASE))
+            count = await role_btn.count()
+            for i in range(count):
+                candidate = role_btn.nth(i)
+                if await candidate.is_visible(timeout=1000):
+                    button_found = candidate
+                    break
+        except Exception:
+            pass
 
     if not button_found:
         logger.error("Like/Suka button not found on the page.")
         return False
 
-    await button_found.scroll_into_view_if_needed()
-    pre_click_delay = random.uniform(5.0, 15.0)
-    logger.info(f"Waiting {pre_click_delay:.2f}s before clicking Like button...")
-    await asyncio.sleep(pre_click_delay)
+    try:
+        await button_found.scroll_into_view_if_needed()
+        pre_click_delay = random.uniform(2.0, 5.0)
+        logger.info(f"Waiting {pre_click_delay:.2f}s before clicking Like button...")
+        await asyncio.sleep(pre_click_delay)
 
-    await button_found.click(timeout=10000)
-    logger.info("Successfully clicked the Like/Suka button.")
-    
-    await asyncio.sleep(random.uniform(3.0, 6.0))
-    return True
+        await button_found.click(timeout=10000)
+        logger.info("Successfully clicked the Like/Suka button.")
+        await asyncio.sleep(random.uniform(2.0, 4.0))
+        return True
+    except Exception as err:
+        logger.error(f"Standard click failed ({err}), attempting JavaScript click fallback...")
+        try:
+            await button_found.evaluate("el => el.click()")
+            logger.info("JS click dispatched successfully.")
+            await asyncio.sleep(random.uniform(2.0, 4.0))
+            return True
+        except Exception as js_err:
+            logger.error(f"JS click fallback failed: {js_err}")
+            return False
 
 
 async def run_auto_like_bot(target_id: int, account_id: int):
     """Background task executing the Playwright automation bot."""
     async with AsyncSessionLocal() as session:
         try:
+            # 1. Fetch Account and Target
             account = await session.get(Account, account_id)
-            if not account or not account.is_active:
-                logger.error(f"Account ID {account_id} not found or inactive.")
-                try:
-                    target = await session.get(Target, target_id)
-                    if target:
-                        target.status = "failed"
-                        session.add(Log(account_id=account_id, target_id=target_id, message="Account inactive or not found."))
-                        await session.commit()
-                except SQLAlchemyError as db_err:
-                    await session.rollback()
-                    logger.error(f"Database error updating target status: {db_err}")
-                return
-
             target = await session.get(Target, target_id)
+
             if not target:
-                logger.error(f"Target ID {target_id} not found.")
+                logger.error(f"Target ID {target_id} not found in database.")
                 return
 
+            if not account or not account.is_active:
+                msg = f"Account ID {account_id} not found or is inactive."
+                logger.error(msg)
+                target.status = "failed"
+                session.add(Log(account_id=account_id if account else None, target_id=target_id, message=msg))
+                await session.commit()
+                return
+
+            # Mark status as in_progress immediately
             target.status = "in_progress"
             await session.commit()
+            logger.info(f"Task {target_id} status updated to IN_PROGRESS for account: {account.username}")
 
-            logger.info(f"Starting bot for Account: {account.username} | Target URL: {target.url_post}")
-
+            # 2. Initialize Playwright Browser Context
             async with async_playwright() as p:
                 context_kwargs = {}
                 if account.user_agent:
                     context_kwargs["user_agent"] = account.user_agent
-                
+
                 proxy_config = parse_proxy(account.proxy)
                 if proxy_config:
                     context_kwargs["proxy"] = proxy_config
@@ -269,98 +488,108 @@ async def run_auto_like_bot(target_id: int, account_id: int):
                         "--window-size=1366,768",
                     ],
                 )
-                
+
                 context = await browser.new_context(**context_kwargs)
 
-                cookies = account.session_cookies
-                if cookies:
-                    if isinstance(cookies, str):
-                        try:
-                            cookies = json.loads(cookies)
-                        except Exception:
-                            pass
-                    await context.add_cookies(cookies if isinstance(cookies, list) else [cookies])
-                    logger.info("Loaded session cookies into browser context.")
+                # Sanitize and load session cookies
+                clean_cookies = sanitize_cookies(account.session_cookies)
+                if clean_cookies:
+                    try:
+                        await context.add_cookies(clean_cookies)
+                        logger.info(f"Loaded {len(clean_cookies)} session cookies into browser context.")
+                    except Exception as cookie_err:
+                        logger.warning(f"Error setting session cookies: {cookie_err}")
+                else:
+                    logger.warning("No valid cookies found for account.")
 
                 page = await context.new_page()
-                await stealth(page)
+                await apply_stealth(page)
 
-                # Block heavy media/images to save RAM and bandwidth
-                await page.route("**/*.{png,jpg,jpeg,gif,webp,mp4,webm}", lambda route: route.abort())
+                # Block heavy media resources asynchronously (fixed route handler)
+                async def block_media(route):
+                    if route.request.resource_type in ["media", "font"]:
+                        await route.abort()
+                    else:
+                        await route.continue_()
+
+                await page.route("**/*", block_media)
 
                 try:
-                    logger.info(f"Navigating to URL: {target.url_post}")
+                    logger.info(f"Navigating to Target URL: {target.url_post}")
                     await page.goto(target.url_post, wait_until="domcontentloaded", timeout=60000)
 
+                    # Check for login redirection or login prompt
+                    await check_login_status(page)
+
+                    # Simulate browsing behavior
                     await simulate_human_behavior(page)
+
+                    # Perform auto-like action
                     success = await perform_auto_like(page)
 
-                    # Check if stopped during execution
+                    # Re-verify task cancellation state
                     await session.refresh(target)
                     if target.status == "stopped":
-                        logger.info("Task was stopped by user.")
+                        logger.info(f"Task {target_id} was stopped by user during execution.")
                         return
 
                     if success:
                         target.status = "success"
                         session.add(Log(
-                            account_id=account.id, 
-                            target_id=target.id, 
+                            account_id=account.id,
+                            target_id=target.id,
                             message="Successfully liked the Facebook post."
                         ))
-                        logger.info("Target status updated to: SUCCESS")
+                        await session.commit()
+                        logger.info(f"Task {target_id} completed successfully (SUCCESS).")
                     else:
                         raise Exception("Failed to locate or click the Like button.")
 
                 except asyncio.CancelledError:
-                    logger.info(f"Task for target {target_id} was cancelled.")
-                    try:
-                        await session.rollback()
-                        target = await session.get(Target, target_id)
-                        if target:
-                            target.status = "stopped"
-                            session.add(Log(account_id=account.id, target_id=target.id, message="Task stopped/cancelled."))
-                            await session.commit()
-                    except SQLAlchemyError as db_err:
-                        await session.rollback()
-                        logger.error(f"Database error during cancellation handling: {db_err}")
+                    logger.info(f"Task {target_id} received cancellation request.")
+                    target.status = "stopped"
+                    session.add(Log(account_id=account.id, target_id=target.id, message="Task stopped/cancelled by user."))
+                    await session.commit()
                     raise
                 except Exception as bot_err:
                     error_msg = str(bot_err)
-                    logger.error(f"Automation error: {error_msg}")
-                    try:
-                        await session.rollback()
-                        target = await session.get(Target, target_id)
-                        if target and target.status != "stopped":
-                            target.status = "failed"
-                            session.add(Log(
-                                account_id=account.id, 
-                                target_id=target.id, 
-                                message=f"Error: {error_msg}"
-                            ))
-                            await session.commit()
-                    except SQLAlchemyError as db_err:
-                        await session.rollback()
-                        logger.error(f"Database error during error handling: {db_err}")
-                
+                    logger.error(f"Automation error for target {target_id}: {error_msg}")
+                    target.status = "failed"
+                    session.add(Log(
+                        account_id=account.id,
+                        target_id=target.id,
+                        message=f"Error: {error_msg}"
+                    ))
+                    await session.commit()
                 finally:
                     try:
                         await context.close()
                         await browser.close()
                     except Exception:
                         pass
-                    try:
-                        await session.commit()
-                    except SQLAlchemyError:
-                        await session.rollback()
 
         except asyncio.CancelledError:
-            pass
-        except SQLAlchemyError as db_exc:
-            await session.rollback()
-            logger.critical(f"Database error in background task: {db_exc}")
+            logger.info(f"Task {target_id} process cancelled.")
+            async with AsyncSessionLocal() as rollback_session:
+                try:
+                    t = await rollback_session.get(Target, target_id)
+                    if t and t.status != "stopped":
+                        t.status = "stopped"
+                        rollback_session.add(Log(account_id=account_id, target_id=target_id, message="Task stopped/cancelled."))
+                        await rollback_session.commit()
+                except Exception:
+                    pass
         except Exception as exc:
-            logger.critical(f"Critical error in background task: {exc}")
+            logger.critical(f"Critical unhandled error in background task for target {target_id}: {exc}")
+            async with AsyncSessionLocal() as err_session:
+                try:
+                    t = await err_session.get(Target, target_id)
+                    if t and t.status not in ["success", "stopped"]:
+                        t.status = "failed"
+                        err_session.add(Log(account_id=account_id, target_id=target_id, message=f"Critical error: {str(exc)}"))
+                        await err_session.commit()
+                except Exception:
+                    pass
         finally:
             if target_id in active_tasks:
                 del active_tasks[target_id]
@@ -465,6 +694,7 @@ async def auto_like_endpoint(payload: AutoLikeRequest, background_tasks: Backgro
         await db.commit()
         await db.refresh(new_target)
 
+        # Launch background task and track it
         task = asyncio.create_task(run_auto_like_bot(target_id=new_target.id, account_id=payload.account_id))
         active_tasks[new_target.id] = task
 
@@ -556,7 +786,6 @@ async def test_proxy(payload: ProxyTestRequest):
 @app.get("/api/stats", status_code=status.HTTP_200_OK)
 async def get_stats(db: AsyncSession = Depends(get_db)):
     try:
-        from sqlalchemy import func
         acc_count = await db.execute(select(func.count(Account.id)))
         active_acc_count = await db.execute(select(func.count(Account.id)).where(Account.is_active == True))
         target_count = await db.execute(select(func.count(Target.id)))
@@ -582,7 +811,6 @@ async def get_stats(db: AsyncSession = Depends(get_db)):
         await db.rollback()
         logger.error(f"Database error in get_stats: {e}")
         raise HTTPException(status_code=500, detail="Database error occurred while fetching stats.")
-
 
 
 @app.get("/")
