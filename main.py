@@ -4,6 +4,8 @@ import logging
 import os
 import random
 import re
+import time
+from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Optional, Any, List, Dict
 from urllib.parse import urlparse
@@ -40,6 +42,38 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# In-memory rate limiter store: IP -> list of request timestamps (Throttling & Rate Limiting)
+request_records: Dict[str, list] = defaultdict(list)
+RATE_LIMIT_WINDOW = 60  # seconds
+RATE_LIMIT_MAX_REQUESTS = 120  # max requests per minute per IP
+
+@app.middleware("http")
+async def security_and_rate_limit_middleware(request: Request, call_next):
+    # 1. Rate Limiting & Throttling Enforcement
+    client_ip = request.client.host if request.client else "unknown"
+    now = time.time()
+    timestamps = request_records[client_ip]
+    timestamps = [t for t in timestamps if t > now - RATE_LIMIT_WINDOW]
+    if len(timestamps) >= RATE_LIMIT_MAX_REQUESTS:
+        return JSONResponse(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            content={"detail": "Rate limit exceeded. Too many requests in a given time window."}
+        )
+    timestamps.append(now)
+    request_records[client_ip] = timestamps
+
+    # 2. Process Request
+    response = await call_next(request)
+
+    # 3. Security Headers (OWASP Recommended)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    response.headers["Content-Security-Policy"] = "default-src 'self'"
+
+    return response
 
 # Track active background tasks: target_id -> asyncio.Task
 active_tasks: Dict[int, asyncio.Task] = {}
@@ -740,6 +774,20 @@ async def auto_like_endpoint(payload: AutoLikeRequest, background_tasks: Backgro
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Account does not exist or is inactive."
             )
+
+        # Idempotency check: prevent duplicate tasks for the same target URL currently pending or in progress
+        existing_stmt = select(Target).where(
+            Target.url_post == payload.target_url,
+            Target.status.in_(["pending", "in_progress"])
+        )
+        existing_res = await db.execute(existing_stmt)
+        existing_target = existing_res.scalars().first()
+        if existing_target:
+            return {
+                "message": "Idempotent request: Task for this URL is already pending or in progress.",
+                "target_id": existing_target.id,
+                "status": existing_target.status
+            }
 
         new_target = Target(url_post=payload.target_url, status="pending")
         db.add(new_target)
