@@ -10,9 +10,8 @@ from urllib.parse import urlparse
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, status, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
-from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc, delete, func, update
 from sqlalchemy.exc import SQLAlchemyError, IntegrityError, OperationalError
@@ -309,13 +308,31 @@ async def handle_facebook_popups(page: Page):
             pass
 
 
+async def check_action_block(page: Page):
+    """Detect if Facebook has action-blocked or restricted the account from liking."""
+    block_indicators = [
+        'text="Tindakan Ini Dibatasi"',
+        'text="You’re Temporarily Blocked"',
+        'text="Action Blocked"',
+        'text="You can\'t use this feature right now"',
+        'text="Anda tidak dapat menggunakan fitur ini sekarang"',
+    ]
+    for ind in block_indicators:
+        try:
+            loc = page.locator(ind)
+            if await loc.count() > 0 and await loc.first.is_visible(timeout=800):
+                raise Exception("Account Action Blocked: This Facebook account is temporarily restricted from liking posts.")
+        except Exception as e:
+            if "Action Blocked" in str(e) or "Dibatasi" in str(e):
+                raise
+
+
 async def check_login_status(page: Page):
     """Verifies that the browser session is logged in and not redirected to login page."""
     current_url = page.url.lower()
     if "login" in current_url or "checkpoint" in current_url:
         raise Exception("Account session cookies are invalid or expired (redirected to Facebook login page).")
 
-    # Check for login form fields
     try:
         login_form = page.locator('input[name="email"], input[id="email"]')
         if await login_form.count() > 0 and await login_form.first.is_visible(timeout=1000):
@@ -327,7 +344,7 @@ async def check_login_status(page: Page):
 
 async def simulate_human_behavior(page: Page):
     """Simulates realistic human browsing behavior with random scrolling and pauses."""
-    delay = random.uniform(3.0, 7.0)
+    delay = random.uniform(2.0, 5.0)
     logger.info(f"Applying navigation delay: {delay:.2f} seconds")
     await asyncio.sleep(delay)
 
@@ -342,9 +359,10 @@ async def simulate_human_behavior(page: Page):
 
 
 async def perform_auto_like(page: Page) -> bool:
-    """Locates and clicks the Facebook Like/Suka button, or detects if post is already liked."""
+    """Locates and clicks the Facebook Like/Suka button, supporting Desktop and Mobile FB interfaces."""
     logger.info("Searching for Like/Suka button...")
     await handle_facebook_popups(page)
+    await check_action_block(page)
 
     # 1. Check if post is ALREADY LIKED
     already_liked_selectors = [
@@ -355,6 +373,9 @@ async def perform_auto_like(page: Page) -> bool:
         'div[role="button"][aria-pressed="true"]',
         'xpath=//div[@role="button" and (contains(@aria-label, "Batal") or contains(@aria-label, "Hapus") or contains(@aria-label, "Remove") or contains(@aria-label, "Unlike"))]',
         'xpath=//span[text()="Disukai" or text()="Liked"]',
+        'a[href*="/a/unlike.php"]',
+        'input[type="submit"][value*="Batal Suka"]',
+        'input[type="submit"][value*="Unlike"]',
     ]
 
     for sel in already_liked_selectors:
@@ -366,7 +387,7 @@ async def perform_auto_like(page: Page) -> bool:
         except Exception:
             pass
 
-    # 2. Search for UNLIKED Like/Suka button
+    # 2. Search for UNLIKED Like/Suka button (Desktop & Mobile selectors)
     like_selectors = [
         'div[role="button"][aria-label="Suka"]',
         'div[role="button"][aria-label="Like"]',
@@ -376,6 +397,9 @@ async def perform_auto_like(page: Page) -> bool:
         'xpath=//span[(text()="Suka" or text()="Like")]/ancestor::div[@role="button"]',
         'xpath=//span[contains(text(), "Suka") or contains(text(), "Like")]/ancestor::div[@role="button"]',
         'a[href*="/a/like.php"]',
+        'a[href*="like.php"]',
+        'input[type="submit"][value="Suka"]',
+        'input[type="submit"][value="Like"]',
         'button:has-text("Suka")',
         'button:has-text("Like")',
     ]
@@ -419,22 +443,36 @@ async def perform_auto_like(page: Page) -> bool:
 
     try:
         await button_found.scroll_into_view_if_needed()
-        pre_click_delay = random.uniform(2.0, 5.0)
+        pre_click_delay = random.uniform(1.5, 3.0)
         logger.info(f"Waiting {pre_click_delay:.2f}s before clicking Like button...")
         await asyncio.sleep(pre_click_delay)
 
-        await button_found.click(timeout=10000)
+        # Force click or dispatch event to bypass reaction hover panels
+        try:
+            await button_found.click(timeout=5000, force=True)
+        except Exception:
+            await button_found.dispatch_event("click")
+
         logger.info("Successfully clicked the Like/Suka button.")
         await asyncio.sleep(random.uniform(2.0, 4.0))
+
+        # Check for Facebook action block prompt
+        await check_action_block(page)
         return True
+
     except Exception as err:
+        if "Action Blocked" in str(err) or "Dibatasi" in str(err):
+            raise
         logger.error(f"Standard click failed ({err}), attempting JavaScript click fallback...")
         try:
             await button_found.evaluate("el => el.click()")
             logger.info("JS click dispatched successfully.")
             await asyncio.sleep(random.uniform(2.0, 4.0))
+            await check_action_block(page)
             return True
         except Exception as js_err:
+            if "Action Blocked" in str(js_err) or "Dibatasi" in str(js_err):
+                raise
             logger.error(f"JS click fallback failed: {js_err}")
             return False
 
@@ -506,7 +544,7 @@ async def run_auto_like_bot(target_id: int, account_id: int):
                 page = await context.new_page()
                 await apply_stealth(page)
 
-                # Block heavy media resources asynchronously (fixed route handler)
+                # Block heavy media resources asynchronously
                 async def block_media(route):
                     if route.request.resource_type in ["media", "font"]:
                         await route.abort()
@@ -528,6 +566,18 @@ async def run_auto_like_bot(target_id: int, account_id: int):
                     # Perform auto-like action
                     success = await perform_auto_like(page)
 
+                    # Mobile Fallback Retry: If Desktop FB failed to locate/click button, retry via mbasic.facebook.com
+                    if not success and "www.facebook.com" in target.url_post:
+                        mobile_url = target.url_post.replace("www.facebook.com", "mbasic.facebook.com")
+                        logger.info(f"Retrying auto-like via mobile interface: {mobile_url}")
+                        try:
+                            await page.goto(mobile_url, wait_until="domcontentloaded", timeout=30000)
+                            await check_login_status(page)
+                            await handle_facebook_popups(page)
+                            success = await perform_auto_like(page)
+                        except Exception as mob_err:
+                            logger.warning(f"Mobile interface retry warning: {mob_err}")
+
                     # Re-verify task cancellation state
                     await session.refresh(target)
                     if target.status == "stopped":
@@ -544,7 +594,7 @@ async def run_auto_like_bot(target_id: int, account_id: int):
                         await session.commit()
                         logger.info(f"Task {target_id} completed successfully (SUCCESS).")
                     else:
-                        raise Exception("Failed to locate or click the Like button.")
+                        raise Exception("Failed to locate or click the Like button on both Desktop and Mobile interfaces.")
 
                 except asyncio.CancelledError:
                     logger.info(f"Task {target_id} received cancellation request.")
@@ -562,6 +612,7 @@ async def run_auto_like_bot(target_id: int, account_id: int):
                         message=f"Error: {error_msg}"
                     ))
                     await session.commit()
+                    
                 finally:
                     try:
                         await context.close()
@@ -742,32 +793,6 @@ async def stop_target(target_id: int, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=500, detail="Database error occurred while stopping target task.")
 
 
-@app.delete("/api/targets/{target_id}", status_code=status.HTTP_200_OK)
-async def delete_target(target_id: int, db: AsyncSession = Depends(get_db)):
-    """Delete a target and its associated logs. Also cancels any running task."""
-    try:
-        target = await db.get(Target, target_id)
-        if not target:
-            raise HTTPException(status_code=404, detail="Target not found.")
-
-        if target_id in active_tasks:
-            task = active_tasks[target_id]
-            if not task.done():
-                task.cancel()
-            del active_tasks[target_id]
-
-        await db.execute(delete(Log).where(Log.target_id == target_id))
-        await db.delete(target)
-        await db.commit()
-        return {"message": f"Target {target_id} deleted successfully."}
-    except HTTPException:
-        raise
-    except SQLAlchemyError as e:
-        await db.rollback()
-        logger.error(f"Database error in delete_target: {e}")
-        raise HTTPException(status_code=500, detail="Database error occurred while deleting target.")
-
-
 @app.get("/api/targets", status_code=status.HTTP_200_OK)
 async def list_targets(db: AsyncSession = Depends(get_db)):
     try:
@@ -840,27 +865,11 @@ async def get_stats(db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=500, detail="Database error occurred while fetching stats.")
 
 
-# Serve React Frontend
-_dist = os.path.join(os.path.dirname(__file__), "dist")
-
-if os.path.isdir(_dist):
-    _assets = os.path.join(_dist, "assets")
-    if os.path.isdir(_assets):
-        app.mount("/assets", StaticFiles(directory=_assets), name="assets")
-
-    @app.get("/favicon.svg", include_in_schema=False)
-    async def favicon():
-        return FileResponse(os.path.join(_dist, "favicon.svg"))
-
-    @app.get("/", response_class=HTMLResponse, include_in_schema=False)
-    async def spa_root():
-        with open(os.path.join(_dist, "index.html"), encoding="utf-8") as f:
-            return f.read()
-
-    @app.get("/{full_path:path}", response_class=HTMLResponse, include_in_schema=False)
-    async def spa_catch_all(full_path: str):
-        reserved = ("api/", "health", "docs", "openapi.json", "redoc")
-        if any(full_path.startswith(r) for r in reserved):
-            raise HTTPException(status_code=404)
-        with open(os.path.join(_dist, "index.html"), encoding="utf-8") as f:
-            return f.read()
+@app.get("/")
+async def root():
+    return {
+        "status": "online",
+        "service": "Facebook Auto-Like Bot API",
+        "version": "1.1.0",
+        "docs": "/docs"
+    }
